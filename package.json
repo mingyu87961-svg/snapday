@@ -1,0 +1,14 @@
+{
+  "name": "snapday",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "拾刻 · 一张图进日历：本地 OCR、中文日期核对与 iCalendar 导出",
+  "scripts": {
+    "start": "node scripts/dev.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check dist/app.mjs && node --check dist/lib/engine.mjs && node --check scripts/dev.mjs",
+    "build": "node scripts/verify-build.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

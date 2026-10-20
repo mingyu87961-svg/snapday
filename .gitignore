@@ -1,0 +1,14 @@
+.sites-local/
+.openai/
+.sites-checkout/
+node_modules/
+*.tar.gz
+*.log
+.env
+.env.*
+!.env.example
+artifacts/
+local-notes/
+.private/
+.DS_Store
+Thumbs.db
