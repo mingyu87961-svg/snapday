@@ -1,14 +1,15 @@
 {
   "name": "snapday",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "拾刻 · 一张图进日历：本地 OCR、中文日期核对与 iCalendar 导出",
+  "description": "拾刻 · AI 日程整理：本地 OCR、DeepSeek 多活动提取、账号同步与 iCalendar 导出",
   "scripts": {
-    "start": "node server/node.mjs",
+    "start": "node --env-file-if-exists=.env server/node.mjs",
     "start:static": "node scripts/dev.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check dist/app.mjs && node --check dist/lib/engine.mjs && node --check server/api.mjs && node --check server/sqlite.mjs && node --check server/node.mjs",
+    "eval:ai": "node --env-file-if-exists=.env scripts/eval-ai.mjs",
+    "check": "node --check dist/app.mjs && node --check dist/lib/engine.mjs && node --check server/api.mjs && node --check server/ai.mjs && node --check server/sqlite.mjs && node --check server/node.mjs",
     "build": "node scripts/verify-build.mjs"
   },
   "engines": { "node": ">=22.13" }

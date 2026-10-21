@@ -40,8 +40,8 @@ function bootApp(moduleURL) {
     return elements.get(selector);
   };
   const context = vm.createContext({
-    URL, Intl, Date, console,
-    api: { health:async () => ({ok:false}) }, APIError:Error,
+    URL, Intl, Date, console, AbortController,
+    api: { health:async () => ({ok:false}), aiStatus:async () => ({configured:false}) }, APIError:Error,
     // A different document URL proves resource paths use their module's base.
     location: { href: 'https://unrelated.invalid/other/page.html' },
     localStorage: { getItem: () => null },

@@ -6,12 +6,14 @@ export class APIError extends Error {
 }
 let boundAccount = null;
 
-async function request(path, {method = 'GET', body, calendar = false} = {}) {
+async function request(path, {method = 'GET', body, calendar = false, signal, timeoutMs = 20000} = {}) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const cancel = () => controller.abort();
+  if (signal?.aborted) controller.abort(); else signal?.addEventListener('abort', cancel, {once:true});
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers = body === undefined ? {Accept:calendar ? 'text/calendar' : 'application/json'} : {'Content-Type':'application/json', Accept:'application/json'};
-    if (boundAccount && (path.startsWith('/events') || path.startsWith('/calendar.ics'))) headers['X-Snapday-Account'] = boundAccount;
+    if (boundAccount && (path.startsWith('/events') || path.startsWith('/calendar.ics') || path === '/ai/extract' || path === '/ai/history')) headers['X-Snapday-Account'] = boundAccount;
     const response = await fetch(`/api${path}`, {
       method, credentials:'same-origin', cache:'no-store', signal:controller.signal,
       headers,
@@ -25,8 +27,10 @@ async function request(path, {method = 'GET', body, calendar = false} = {}) {
     return data;
   } catch (error) {
     if (error instanceof APIError) throw error;
+    if (signal?.aborted) throw new APIError('已取消本次 AI 整理。', 0, 'REQUEST_CANCELLED');
+    if (error.name === 'AbortError' && path === '/ai/extract') throw new APIError('AI 整理用时较长，请稍后重试，或点击本地整理。', 0, 'REQUEST_TIMEOUT');
     throw new APIError(error.name === 'AbortError' ? '连接超时，未确认写入结果。请刷新日程后再试。' : '暂时无法连接服务，请检查网络后重试。');
-  } finally { clearTimeout(timeout); }
+  } finally { clearTimeout(timeout); signal?.removeEventListener('abort', cancel); }
 }
 
 export const api = {
@@ -41,4 +45,7 @@ export const api = {
   remove:(id,version) => request(`/events/${encodeURIComponent(id)}`, {method:'DELETE', body:{version}}),
   import:events => request('/events/import', {method:'POST', body:{events}}),
   calendar:ids => request(`/calendar.ics${ids?.length ? `?ids=${encodeURIComponent(ids.join(','))}` : ''}`, {calendar:true}),
+  aiStatus:() => request('/ai/status'),
+  aiExtract:(body,{signal} = {}) => request('/ai/extract', {method:'POST', body, signal, timeoutMs:60000}),
+  aiHistory:() => request('/ai/history'),
 };

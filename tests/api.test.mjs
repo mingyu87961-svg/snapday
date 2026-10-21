@@ -35,7 +35,7 @@ async function register(api, username = 'alice', extra = {}) {
 
 test('health / session、注册登录、密码哈希与会话令牌持久化安全', async t => {
   const app = setup(t);
-  assert.deepEqual((await call(app.api, '/api/health')).data, { ok: true, version: '2.0.0', storage: 'sqlite' });
+  assert.deepEqual((await call(app.api, '/api/health')).data, { ok: true, version: '3.0.0', storage: 'sqlite' });
   assert.deepEqual((await call(app.api, '/api/session')).data, { user: null });
   const registration = await register(app.api, 'Alice', { displayName: '小明' });
   assert.equal(registration.data.user.username, 'alice');

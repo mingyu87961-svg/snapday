@@ -22,6 +22,12 @@ let sessionExpired = false;
 let cloudNeedsRefresh = false;
 let writeBusy = false;
 let authMode = 'login';
+let aiService = null;
+let aiStatusLoading = false;
+let aiRunning = false;
+let aiController = null;
+let aiOperation = 0;
+let aiMessage = '';
 
 function todayShanghai() {
   const parts = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
@@ -85,13 +91,20 @@ function accountUI() {
   $('#auth-open').disabled = writeBusy;
   $('#account-notice-text').textContent = sessionExpired ? '登录已过期。草稿仍在这里，请重新登录原账号后继续。' : cloudNeedsRefresh ? '云端日程已有更新，请刷新后再核对。未保存的草稿会保留。' : cloud ? '这里展示你的账号日程。可手动刷新其他设备的修改，本地日程不会自动上传。' : '本地体验的日程保存在当前浏览器。登录后可使用独立的账号日程。';
   $('#privacy-copy').textContent = cloud ? '图片在本地识别 · 已确认日程保存在你的账号中' : '图片在本地处理 · 数据只保存在此浏览器';
+  updateAIUI();
 }
 
 function setWriting(busy) {
   writeBusy = busy;
   $$('.event-card input,.event-card select,.event-card button,[data-edit],[data-delete],[data-export]').forEach(el => el.disabled = busy);
   $('#recognize-button').disabled = busy || recognizing || !sourceData;
+  $('#recognize-text-only').disabled = busy || recognizing || !sourceData;
   $('#parse-text').disabled = busy || recognizing;
+  $('#source-text').disabled = busy || recognizing;
+  $('#reference-date').disabled = busy || recognizing;
+  $('#ocr-layout').disabled = busy || recognizing;
+  $('#upload-trigger').disabled = busy || recognizing;
+  $$('[data-example]').forEach(el => el.disabled = busy || recognizing);
   $('#auth-submit').disabled = busy;
   $('#auth-close').disabled = busy;
   accountUI(); updateStats();
@@ -124,6 +137,7 @@ async function activateAccount(user) {
   try { result = await api.list(); }
   catch (error) { api.setAccount(accountUser?.id || null); throw error; }
   accountUser = user; knownSessionUser = user; sessionExpired = false; cloudNeedsRefresh = false;
+  $('#ai-consent').checked = false;
   events = result.events; $('#timeline-search').value = ''; $('#timeline-filter').value = 'all';
   renderTimeline(); accountUI();
 }
@@ -206,6 +220,7 @@ async function logoutAccount() {
   try {
     try { await api.logout(); } catch (error) { if (error.status !== 401) throw error; }
     accountUser = null; knownSessionUser = null; sessionExpired = false; cloudNeedsRefresh = false; api.setAccount(null);
+    $('#ai-consent').checked = false;
     restore(); renderTimeline(); accountUI(); toast('已退出，回到本地日程。', 'success');
   } catch (error) { cloudError(error); }
   finally { setWriting(false); }
@@ -258,9 +273,90 @@ async function importLocalEvents() {
 }
 
 function setStatus(message, type = '') { const el = $('#analysis-status'); el.textContent = message; el.className = `analysis-status ${type}`; }
+
+function updateAIUI() {
+  $('#ai-extract').disabled = writeBusy || recognizing || aiStatusLoading || (Boolean(accountUser) && aiService?.configured === false);
+  $('#ai-extract').innerHTML = `${icon('arrow')}${aiRunning ? 'AI 正在整理…' : 'AI 理解并整理'}`;
+  $('#ai-cancel').hidden = !aiRunning;
+  $('#ai-cancel').disabled = !aiRunning;
+  $('#ai-consent').disabled = writeBusy || recognizing;
+  $('#ai-status-refresh').disabled = writeBusy || recognizing || aiStatusLoading;
+  $('#ai-status').textContent = aiMessage || (aiService?.configured ? accountUser && !sessionExpired ? 'DeepSeek 已启用。请确认本次发送内容后再整理。' : 'DeepSeek 已启用，登录后可使用。所有结果仍需人工核对。' : 'AI 尚未启用，仍可本地整理。');
+  $('#ai-status').classList.toggle('is-processing', aiRunning);
+}
+
+async function loadAIStatus() {
+  if (aiStatusLoading || aiRunning) return;
+  aiStatusLoading = true; aiMessage = '正在检查 AI 服务…'; updateAIUI();
+  try {
+    const result = await api.aiStatus();
+    aiService = {configured:result.configured === true,provider:'DeepSeek',model:result.model || '',promptVersion:result.promptVersion || ''};
+    aiMessage = '';
+  } catch (error) {
+    aiService = null;
+    aiMessage = [404,503].includes(error.status) || error.code === 'API_UNAVAILABLE' ? 'AI 尚未启用，仍可本地整理。' : '暂时无法检查 AI 服务，请稍后刷新状态。仍可本地整理。';
+  } finally { aiStatusLoading = false; updateAIUI(); }
+}
+
+async function extractWithAI() {
+  if (writeBusy || recognizing || aiStatusLoading) return;
+  if (drafts.length) return toast('请先保存或舍弃已有草稿，再使用 AI 整理，避免覆盖你的修改。');
+  if (!accountUser || sessionExpired) { $('#text-input-details').open = true; return openAuth(); }
+  if (aiService?.configured !== true) return toast('AI 尚未启用或状态未确认，仍可点击本地规则整理。');
+  const text = $('#source-text').value.trim();
+  const referenceDate = $('#reference-date').value || todayShanghai();
+  if (!text) return toast('请先粘贴通知文字，或从截图识别文字。', 'error');
+  if (text.length > 12000) return toast('通知文字过长，请保留需要整理的内容（最多 12000 字）。', 'error');
+  if (!$('#ai-consent').checked) { toast('请勾选本次发送通知文字给 DeepSeek 的同意项。'); $('#ai-consent').focus(); return; }
+  const token = ++aiOperation;
+  const owner = accountUser.id;
+  const controller = new AbortController(); aiController = controller; aiRunning = true;
+  $('#ai-consent').checked = false;
+  aiMessage = '正在请 DeepSeek 理解当前通知。结果会先作为草稿，尚未保存。';
+  setWriting(true);
+  try {
+    await assertCloudSession();
+    if (token !== aiOperation || controller.signal.aborted) return;
+    const result = await api.aiExtract({text,referenceDate,consent:true}, {signal:controller.signal});
+    if (token !== aiOperation || controller.signal.aborted || accountUser?.id !== owner) return;
+    if (!Array.isArray(result.events) || result.events.length > 20) throw new APIError('AI 返回的事项格式异常，请重试或手动使用本地规则整理。', 502, 'INVALID_AI_RESPONSE');
+    const asString = value => typeof value === 'string' ? value : '';
+    drafts = result.events.map(e => ({
+      id:`ai_${crypto.randomUUID()}`,title:asString(e.title),kind:e.kind === 'deadline' ? 'deadline' : 'event',
+      date:asString(e.date),startTime:asString(e.startTime),endDate:asString(e.endDate),endTime:asString(e.endTime),
+      location:asString(e.location),sourceText:asString(e.sourceText),sourceName:sourceName || '通知文字',origin:'DeepSeek AI',
+      dateConfirmed:false,reminderMinutes:30,createdAt:new Date().toISOString(),
+      aiEvidence:{verified:e.aiEvidence?.verified === true,text:asString(e.aiEvidence?.text)},
+      aiWarnings:Array.isArray(e.aiWarnings) ? e.aiWarnings.filter(w => typeof w === 'string').slice(0,10) : [],
+    }));
+    renderDrafts();
+    const warnings = Array.isArray(result.warnings) ? result.warnings.filter(w => typeof w === 'string').slice(0,10) : [];
+    const summary = asString(result.summary);
+    aiMessage = drafts.length ? 'DeepSeek 结果已列为草稿，请逐项核对后保存。' : 'DeepSeek 未整理出可用事项。请补充通知内容，或自行使用本地规则整理。';
+    setStatus([aiMessage,summary,...warnings].filter(Boolean).join(' '), drafts.length ? 'success' : 'warning');
+    $('#mode-label').textContent = 'DeepSeek AI 草稿';
+    if (drafts.length) toast('AI 草稿已就绪。核对并确认后，才会保存到日程。', 'success');
+  } catch (error) {
+    if (token !== aiOperation || controller.signal.aborted || error.code === 'REQUEST_CANCELLED') return;
+    if (error.status === 401) cloudError(error);
+    aiMessage = error.status === 429 ? 'AI 请求较多，请稍后重试。仍可自行点击本地规则整理。' : error.status === 503 ? `${error.message || 'AI 服务暂不可用'}。仍可使用本地规则整理。` : error.code === 'REQUEST_TIMEOUT' || error.status === 504 ? 'AI 整理超时，请稍后重试，或自行使用本地规则整理。' : error.message || 'AI 整理未完成，请重试或自行使用本地规则整理。';
+    setStatus(aiMessage, 'error'); toast(aiMessage, 'error');
+  } finally {
+    if (token === aiOperation) { aiController = null; aiRunning = false; setWriting(false); }
+  }
+}
+
+function cancelAI() {
+  if (!aiRunning) return;
+  aiOperation++; aiController?.abort(); aiController = null; aiRunning = false;
+  aiMessage = '已取消 AI 整理，未添加草稿。你仍可使用本地规则整理。';
+  setStatus(aiMessage); setWriting(false);
+}
+
 function setBusy(busy) {
   recognizing = busy;
   $('#recognize-button').disabled = busy || writeBusy || !sourceData;
+  $('#recognize-text-only').disabled = busy || writeBusy || !sourceData;
   $('#parse-text').disabled = busy || writeBusy;
   $('#source-text').disabled = busy || writeBusy;
   $('#reference-date').disabled = busy || writeBusy;
@@ -268,6 +364,7 @@ function setBusy(busy) {
   $('#ocr-progress').hidden = !busy;
   $('#upload-trigger').disabled = busy || writeBusy;
   $$('[data-example]').forEach(button => button.disabled = busy || writeBusy);
+  updateAIUI();
 }
 
 async function rasterize(src) {
@@ -290,10 +387,12 @@ async function loadImage(src, name) {
   if (drafts.length) return toast('请先保存或舍弃待核对事项，再选择另一张截图。');
   try {
     const data = await rasterize(src);
+    if (writeBusy || recognizing || drafts.length) return toast('当前操作或待核对事项尚未完成，未替换截图。');
     sourceData = data; sourceName = name;
     $('#preview-image').src = data; $('#preview-image').alt = name;
     $('#image-preview').hidden = false; $('#upload-empty').hidden = true;
     $('#recognize-button').disabled = false;
+    $('#recognize-text-only').disabled = false;
     drafts = []; renderDrafts(); $('#source-text').value = '';
     $('#mode-label').textContent = '浏览器本地识别';
     setStatus('截图已准备好，点击「识别截图」开始。');
@@ -341,9 +440,10 @@ async function getWorker(token) {
   return workerPromise;
 }
 
-async function recognize() {
+async function recognize(options = {}) {
   if (!sourceData || recognizing || writeBusy) return;
   if (drafts.length) return toast('请先保存或舍弃待核对事项，再重新识别。');
+  const textOnly = options?.textOnly === true;
   const token = ++operation;
   setBusy(true); setStatus('正在读取截图，原图和识别内容仅在当前浏览器处理。');
   $('#progress-bar').value = 0;
@@ -355,7 +455,14 @@ async function recognize() {
     const text = result.data.text.trim();
     $('#source-text').value = text;
     if (!text) throw new Error('没有识别到可用文字。请裁剪清晰的通知正文，或粘贴文字。');
-    parseSource('截图 OCR');
+    $('#ai-consent').checked = false;
+    if (textOnly) {
+      $('#text-input-details').open = true;
+      $('#mode-label').textContent = '本地 OCR · 文字已提取';
+      aiMessage = ''; updateAIUI();
+      setStatus('文字已提取，尚未生成日程。你可以核对文字后，选择 AI 理解并整理，或使用本地规则整理。', 'success');
+      toast('文字已就绪，请在下方选择整理方式。', 'success');
+    } else parseSource('截图 OCR');
   } catch (error) {
     if (token === operation) {
       setStatus(error.message || '识别失败，请重试或使用文字输入。', 'error');
@@ -400,10 +507,18 @@ function field(label, name, type, value, extra = '', full = false) {
   return `<label class="field${full ? ' full' : ''}"><span>${label}</span><input name="${name}" type="${type}" value="${escape(value)}" ${extra}></label>`;
 }
 
+function aiDraftEvidence(event) {
+  if (event.origin !== 'DeepSeek AI') return '';
+  const evidence = event.aiEvidence;
+  const verified = evidence?.verified === true && typeof evidence.text === 'string' && evidence.text.trim();
+  const warnings = Array.isArray(event.aiWarnings) ? event.aiWarnings.filter(value => typeof value === 'string') : [];
+  return `<div class="ai-draft-evidence ${verified ? 'is-verified' : 'needs-review'}"><strong>${verified ? '原文依据 · 已在通知中找到' : '原文依据 · 需要人工补充'}</strong><p>${verified ? escape(evidence.text) : '未找到可核对的连续原文。请手动对照当前通知，确认每项日期、时间和地点。'}</p></div>${warnings.length ? `<div class="warning ai-draft-warnings"><strong>待确认事项</strong><ul>${warnings.map(value => `<li>${escape(value)}</li>`).join('')}</ul></div>` : ''}`;
+}
+
 function renderDrafts() {
   $('#review-empty').hidden = drafts.length > 0;
   $('#review-list').innerHTML = drafts.map((e, index) => `<form class="event-card" data-draft-index="${index}">
-    <div class="event-card-header"><span class="event-kind ${e.kind === 'deadline' ? 'kind-deadline' : ''}">${icon(e.kind === 'deadline' ? 'clock' : 'calendar')}${e.kind === 'deadline' ? '报名 / 截止事项' : '活动日程'}</span><span class="badge">待核对</span></div>
+    <div class="event-card-header"><span class="event-kind ${e.kind === 'deadline' ? 'kind-deadline' : ''}">${icon(e.kind === 'deadline' ? 'clock' : 'calendar')}${e.kind === 'deadline' ? '报名 / 截止事项' : '活动日程'}</span><span class="badge">${e.origin === 'DeepSeek AI' ? 'AI 草稿 · 待核对' : '待核对'}</span></div>
     <div class="event-form-grid">
       ${field('事项名称','title','text',e.title,'required maxlength="120"',true)}
       ${field('日期','date','date',e.date,'required')}${field('开始 / 截止时间','startTime','time',e.startTime,'required')}
@@ -411,7 +526,8 @@ function renderDrafts() {
       ${field('地点 · 可选','location','text',e.location,'maxlength="200"',true)}
       <label class="field full"><span>提前提醒</span><select name="reminderMinutes">${[[0,'准时提醒'],[15,'提前 15 分钟'],[30,'提前 30 分钟'],[60,'提前 1 小时'],[1440,'提前 1 天'],['none','不设置提醒']].map(([value,label]) => `<option value="${value}" ${(e.reminderMinutes === null ? value === 'none' : String(value) === String(e.reminderMinutes)) ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
     </div>
-    <details class="evidence"><summary>查看对应原文</summary><p>${escape(e.sourceText || $('#source-text').value)}</p></details>
+    ${aiDraftEvidence(e)}
+    <details class="evidence"><summary>查看对应原文${e.origin === 'DeepSeek AI' ? ' · DeepSeek AI' : ''}</summary><p>${escape(e.sourceText || $('#source-text').value)}</p></details>
     ${!e.endTime ? '<p class="draft-hint">未提供结束时间的事项可以保存，但不会参与时间重叠检查。</p>' : ''}
     ${e.pendingConflict ? `<div class="warning conflict-banner"><strong>与已有活动时间重叠</strong><p>${escape(e.conflictTitles)}</p><label class="confirm-check"><input type="checkbox" name="allowConflict" required>我已了解冲突，仍要保存</label></div>` : ''}
     <div class="form-errors" role="alert"></div>
@@ -434,7 +550,7 @@ function renderDrafts() {
     form.addEventListener('input', syncFields);
     form.addEventListener('change', syncFields);
   });
-  $$('[data-discard]').forEach(button => button.onclick = () => { drafts.splice(Number(button.dataset.discard), 1); renderDrafts(); });
+  $$('[data-discard]').forEach(button => button.onclick = () => { if (writeBusy) return; drafts.splice(Number(button.dataset.discard), 1); renderDrafts(); });
   updateStats();
 }
 
@@ -577,7 +693,7 @@ function resetCapture() {
   sourceData = ''; sourceName = '';
   $('#file-input').value = ''; $('#source-text').value = '';
   $('#image-preview').hidden = true; $('#upload-empty').hidden = false;
-  $('#recognize-button').disabled = true; setStatus('上传一张截图，或选择下方样例开始。');
+  $('#recognize-button').disabled = true; $('#recognize-text-only').disabled = true; setStatus('上传一张截图，或选择下方样例开始。');
   $('#capture-section').scrollIntoView({behavior:'smooth'});
 }
 
@@ -585,7 +701,13 @@ $('#reference-date').value = todayShanghai();
 $('#upload-trigger').onclick = () => $('#file-input').click();
 $('#file-input').onchange = event => { loadFile(event.target.files?.[0]); event.target.value = ''; };
 $('#recognize-button').onclick = recognize;
+$('#recognize-text-only').onclick = () => recognize({textOnly:true});
 $('#parse-text').onclick = () => parseSource();
+$('#ai-extract').onclick = extractWithAI;
+$('#ai-cancel').onclick = cancelAI;
+$('#ai-status-refresh').onclick = loadAIStatus;
+$('#source-text').addEventListener('input', () => { $('#ai-consent').checked = false; if (!aiRunning) { aiMessage = ''; updateAIUI(); } });
+$('#reference-date').addEventListener('change', () => { $('#ai-consent').checked = false; });
 $('#cancel-ocr').onclick = cancelOCR;
 $('#remove-image').onclick = resetCapture;
 $('#new-capture').onclick = resetCapture;
@@ -637,3 +759,4 @@ window.addEventListener('storage', event => { if (!accountUser && (event.key ===
 window.addEventListener('beforeunload', event => { if (drafts.length || writeBusy) { event.preventDefault(); event.returnValue = ''; } });
 restore(); renderDrafts(); renderTimeline(); accountUI();
 void initializeAccount();
+void loadAIStatus();

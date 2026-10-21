@@ -38,3 +38,22 @@ CREATE TABLE IF NOT EXISTS auth_attempts (
   attempts INTEGER NOT NULL CHECK (attempts > 0)
 );
 CREATE INDEX IF NOT EXISTS attempts_by_window ON auth_attempts(window_start);
+
+-- AI observability stores safe metadata only, never notice text or credentials.
+CREATE TABLE IF NOT EXISTS ai_runs (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+  error_code TEXT NOT NULL DEFAULT '',
+  input_characters INTEGER NOT NULL DEFAULT 0,
+  event_count INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ai_runs_by_user ON ai_runs(user_id, created_at DESC, id);

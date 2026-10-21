@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { createDatabase } from './sqlite.mjs';
 import { createApi } from './api.mjs';
+import { createDeepSeekAI } from './ai.mjs';
 
 const staticRoot = path.resolve(fileURLToPath(new URL('../dist/', import.meta.url)));
 const types = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.mjs':'text/javascript; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.wasm':'application/wasm', '.gz':'application/gzip', '.json':'application/json; charset=utf-8', '.txt':'text/plain; charset=utf-8' };
@@ -12,7 +13,8 @@ const security = { 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'same-o
 export async function startServer({ port = Number(process.env.PORT || 4173), host = process.env.HOST || '127.0.0.1', databasePath = process.env.DATABASE_PATH || fileURLToPath(new URL('../data/snapday.sqlite', import.meta.url)), publicOrigin = process.env.PUBLIC_ORIGIN || '' } = {}) {
   if (publicOrigin && !['http:', 'https:'].includes(new URL(publicOrigin).protocol)) throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin');
   const db = createDatabase(databasePath);
-  const handleApi = createApi({ db, storage: 'sqlite' });
+  const ai = createDeepSeekAI({ apiKey:process.env.DEEPSEEK_API_KEY || '', model:process.env.DEEPSEEK_MODEL || 'deepseek-flash' });
+  const handleApi = createApi({ db, storage: 'sqlite', ai });
   const server = http.createServer(async (incoming, outgoing) => {
     const apiRequest = incoming.url?.startsWith('/api/');
     try {
@@ -31,7 +33,9 @@ export async function startServer({ port = Number(process.env.PORT || 4173), hos
         }
         const headers = new Headers();
         for (const [name, value] of Object.entries(incoming.headers)) if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(', ') : value);
-        const request = new Request(url, { method:incoming.method, headers, ...(!['GET','HEAD'].includes(incoming.method) ? { body:Buffer.concat(chunks) } : {}) });
+        const controller = new AbortController();
+        outgoing.once('close', () => { if (!outgoing.writableEnded) controller.abort(); });
+        const request = new Request(url, { method:incoming.method, headers, signal:controller.signal, ...(!['GET','HEAD'].includes(incoming.method) ? { body:Buffer.concat(chunks) } : {}) });
         const response = await handleApi(request, { clientIp:incoming.socket.remoteAddress || '' });
         const resultHeaders = { ...security, ...Object.fromEntries(response.headers) };
         if (response.headers.getSetCookie().length) resultHeaders['set-cookie'] = response.headers.getSetCookie();

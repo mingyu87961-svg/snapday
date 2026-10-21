@@ -1,4 +1,5 @@
 import { validateEvent, fingerprint, buildICS } from '../dist/lib/engine.mjs';
+import { createDeepSeekAI, DeepSeekError } from './ai.mjs';
 
 const SESSION_COOKIE = 'snapday_session';
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -111,7 +112,7 @@ function expectedVersion(value) {
 function isUniqueError(error) { return /unique constraint|constraint.*unique|SQLITE_CONSTRAINT_UNIQUE/i.test(String(error?.message || error)); }
 
 /** A Fetch-compatible API. db is a D1-shaped SQLite binding; no request executes DDL. */
-export function createApi({ db, storage = 'sqlite', now = () => Date.now() } = {}) {
+export function createApi({ db, storage = 'sqlite', now = () => Date.now(), ai = createDeepSeekAI() } = {}) {
   if (!db?.prepare || !db?.batch) throw new TypeError('createApi requires a D1-compatible database.');
   const time = () => {
     const value = typeof now === 'function' ? now() : now;
@@ -122,6 +123,8 @@ export function createApi({ db, storage = 'sqlite', now = () => Date.now() } = {
   const prepare = (sql, ...values) => db.prepare(sql).bind(...values);
   const first = (sql, ...values) => prepare(sql, ...values).first();
   const allEvents = async userId => (await prepare('SELECT * FROM events WHERE user_id = ? ORDER BY created_at, id', userId).all()).results.map(eventView);
+  const aiStatus = () => ({ configured: ai.configured === true, provider: 'DeepSeek', model: ai.model, promptVersion: ai.promptVersion });
+  const runView = row => ({ id: row.id, provider: row.provider, model: row.model, promptVersion: row.prompt_version, status: row.status, errorCode: row.error_code, inputCharacters: row.input_characters, eventCount: row.event_count, usage: { promptTokens: row.prompt_tokens, completionTokens: row.completion_tokens, totalTokens: row.total_tokens }, elapsedMs: row.elapsed_ms, createdAt: row.created_at });
   async function currentUser(request, milliseconds) {
     const token = rawToken(request);
     if (!token) return null;
@@ -132,9 +135,9 @@ export function createApi({ db, storage = 'sqlite', now = () => Date.now() } = {
     return { token, statement: prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)', await digest(token), userId, milliseconds, milliseconds + SESSION_MS) };
   }
   async function rateLimit(clientIp, username, kind, milliseconds) {
-    const windowMs = kind === 'register' ? 60 * 60 * 1000 : 15 * 60 * 1000;
+    const windowMs = ['register', 'ai'].includes(kind) ? 60 * 60 * 1000 : 15 * 60 * 1000;
     const start = Math.floor(milliseconds / windowMs) * windowMs;
-    const scopes = kind === 'register' ? [[`register:ip:${clientIp}`, 10]] : [[`login:ip:${clientIp}`, 30], [`login:user:${clientIp}:${username}`, 5]];
+    const scopes = kind === 'register' ? [[`register:ip:${clientIp}`, 10]] : kind === 'ai' ? [[`ai:user:${username}`, 10], [`ai:ip:${clientIp}`, 30]] : [[`login:ip:${clientIp}`, 30], [`login:user:${clientIp}:${username}`, 5]];
     const limits = await Promise.all(scopes.map(async ([scope, maximum]) => ({ key: await digest(scope), maximum })));
     await db.batch([
       ...limits.map(({ key }) => prepare('INSERT INTO auth_attempts (bucket, window_start, attempts) VALUES (?, ?, 1) ON CONFLICT(bucket) DO UPDATE SET attempts = CASE WHEN auth_attempts.window_start = ? THEN auth_attempts.attempts + 1 ELSE 1 END, window_start = ?', key, start, start, start)),
@@ -142,7 +145,7 @@ export function createApi({ db, storage = 'sqlite', now = () => Date.now() } = {
     ]);
     for (const { key, maximum } of limits) {
       const row = await first('SELECT attempts FROM auth_attempts WHERE bucket = ?', key);
-      if (row.attempts > maximum) fail(429, 'RATE_LIMITED', '尝试次数过多，请稍后再试。', { 'Retry-After': String(Math.max(1, Math.ceil((start + windowMs - milliseconds) / 1000))) });
+      if (row.attempts > maximum) fail(429, kind === 'ai' ? 'AI_RATE_LIMITED' : 'RATE_LIMITED', '尝试次数过多，请稍后再试。', { 'Retry-After': String(Math.max(1, Math.ceil((start + windowMs - milliseconds) / 1000))) });
     }
   }
   function insertEvent(userId, event, milliseconds, ignoreDuplicate = false) {
@@ -161,7 +164,8 @@ export function createApi({ db, storage = 'sqlite', now = () => Date.now() } = {
       if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) fail(405, 'METHOD_NOT_ALLOWED', '不支持该请求方法。', { Allow: 'GET, POST, PATCH, DELETE' });
       let body;
       if (method !== 'GET') { checkOrigin(request); body = await readJSON(request); }
-      if (path === '/api/health' && method === 'GET') return json({ ok: true, version: '2.0.0', storage });
+      if (path === '/api/health' && method === 'GET') return json({ ok: true, version: '3.0.0', storage });
+      if (path === '/api/ai/status' && method === 'GET') return json(aiStatus());
       if (path === '/api/session' && method === 'GET') {
         const user = await currentUser(request, milliseconds);
         return json({ user: user ? userView(user) : null });
@@ -201,13 +205,42 @@ export function createApi({ db, storage = 'sqlite', now = () => Date.now() } = {
         if (token) await prepare('DELETE FROM sessions WHERE token_hash = ?', await digest(token)).run();
         return json({ ok: true }, 200, { 'Set-Cookie': cookie(request, '', true) });
       }
-      if (!path.startsWith('/api/events') && path !== '/api/calendar.ics') fail(404, 'NOT_FOUND', '接口不存在。');
+      if (!path.startsWith('/api/events') && path !== '/api/calendar.ics' && !['/api/ai/extract', '/api/ai/history'].includes(path)) fail(404, 'NOT_FOUND', '接口不存在。');
       const user = await currentUser(request, milliseconds);
       if (!user) fail(401, 'AUTH_REQUIRED', '请登录后操作。');
       // A tab can bind requests to the account it rendered. Cookies remain the
       // sole source of authorization; this optional header only detects a switch.
       const accountBinding = request.headers.get('x-snapday-account');
       if (accountBinding !== null && accountBinding !== user.id) fail(401, 'ACCOUNT_CHANGED', '账号已在其他页面切换，请刷新后重试。');
+      if (path === '/api/ai/history' && method === 'GET') {
+        const rows = await prepare('SELECT * FROM ai_runs WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 10', user.id).all();
+        return json({ runs: rows.results.map(runView) });
+      }
+      if (path === '/api/ai/extract' && method === 'POST') {
+        const started = Date.now();
+        const metadata = aiStatus();
+        const inputCharacters = typeof body.text === 'string' ? [...body.text].length : 0;
+        const safeToken = value => Number.isSafeInteger(value) && value >= 0 && value <= 1000000000 ? value : 0;
+        const recordRun = async (status, errorCode, result) => {
+          const usage = result?.usage || {};
+          await prepare('INSERT INTO ai_runs (id, user_id, provider, model, prompt_version, status, error_code, input_characters, event_count, prompt_tokens, completion_tokens, total_tokens, elapsed_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            crypto.randomUUID(), user.id, 'DeepSeek', metadata.model, metadata.promptVersion, status, errorCode, inputCharacters, result?.events?.length || 0, safeToken(usage.promptTokens), safeToken(usage.completionTokens), safeToken(usage.totalTokens), Math.max(0, Date.now() - started), new Date(milliseconds).toISOString()).run();
+        };
+        let result;
+        try {
+          if (body.consent !== true) fail(422, 'AI_CONSENT_REQUIRED', '请先同意将通知文字发送给 DeepSeek。');
+          await rateLimit(String(clientIp).slice(0, 200), user.id, 'ai', milliseconds);
+          if (!metadata.configured) fail(503, 'AI_NOT_CONFIGURED', 'AI 服务尚未配置，请先使用本地整理。');
+          result = await ai.extract({ text: body.text, referenceDate: body.referenceDate, signal: request.signal });
+        } catch (error) {
+          const safeError = error instanceof ApiError || error instanceof DeepSeekError ? error : new ApiError(502, 'AI_FAILED', 'AI 整理暂时失败，请稍后手动重试。');
+          await recordRun('failed', safeError.code, { usage: safeError.usage });
+          if (safeError instanceof DeepSeekError) fail(safeError.status, safeError.code, safeError.message);
+          throw safeError;
+        }
+        await recordRun('success', '', result);
+        return json(result);
+      }
       if (path === '/api/events' && method === 'GET') return json({ events: await allEvents(user.id) });
       if (path === '/api/events' && method === 'POST') {
         const candidate = eventCandidate(body.event);
