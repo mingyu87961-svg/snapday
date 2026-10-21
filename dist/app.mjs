@@ -1,4 +1,5 @@
 import { extractEvents, validateEvent, fingerprint, findConflicts, buildICS } from './lib/engine.mjs';
+import { api, APIError } from './lib/api-client.mjs';
 
 const $ = (selector, base = document) => base.querySelector(selector);
 const $$ = (selector, base = document) => [...base.querySelectorAll(selector)];
@@ -14,6 +15,13 @@ let recognizing = false;
 let operation = 0;
 let workerPromise = null;
 let storageBlocked = false;
+let accountUser = null;
+let knownSessionUser = null;
+let apiAvailable = null;
+let sessionExpired = false;
+let cloudNeedsRefresh = false;
+let writeBusy = false;
+let authMode = 'login';
 
 function todayShanghai() {
   const parts = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
@@ -25,18 +33,30 @@ function toast(message, type = 'info', undo) {
   const box = document.createElement('div');
   box.className = `toast toast-${type}`;
   const text = document.createElement('span'); text.textContent = message; box.append(text);
-  if (undo) { const button = document.createElement('button'); button.textContent = '撤销'; button.onclick = () => { undo(); box.remove(); }; box.append(button); }
+  if (undo) { const button = document.createElement('button'); button.textContent = '撤销'; button.onclick = async () => { if (writeBusy) return; button.disabled = true; try { if (await undo() !== false) box.remove(); else button.disabled = false; } catch { button.disabled = false; } }; box.append(button); }
   $('#toast-container').append(box);
   setTimeout(() => box.remove(), undo ? 10000 : 6000);
 }
 
 function persist(next) {
+  if (accountUser) { toast('账号日程尚未写入云端，请重试。', 'error'); return false; }
   if (storageBlocked) { toast('已有本地数据格式异常，为避免覆盖，暂未写入。可先导出可读取的日程。', 'error'); return false; }
   try { localStorage.setItem(KEY, JSON.stringify({version:1, events:next})); events = next; renderTimeline(); return true; }
   catch { toast('浏览器存储不可用或空间不足，未保存。请先导出已有日程。', 'error'); return false; }
 }
 
+function localSnapshot() {
+  const raw = localStorage.getItem(KEY);
+  if (!raw) return [];
+  const saved = JSON.parse(raw);
+  if (saved.version !== 1 || !Array.isArray(saved.events)) throw new Error('本地日程格式异常，请先导出备份。');
+  if (saved.events.some(e => !e || typeof e.id !== 'string' || e.dateConfirmed !== true || validateEvent(e).length)) throw new Error('部分本地日程格式异常，请先检查并备份。');
+  return saved.events;
+}
+
 function restore() {
+  if (accountUser) return;
+  storageBlocked = false; events = [];
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return;
@@ -48,17 +68,206 @@ function restore() {
   } catch { storageBlocked = true; toast('无法读取已有记录。原始数据未改动，已暂停写入以保护数据。', 'error'); }
 }
 
+function accountUI() {
+  const cloud = Boolean(accountUser);
+  $('#workspace-label').textContent = cloud ? (sessionExpired ? '云端登录已过期' : '已登录云端') : '本地体验';
+  $('#workspace-status').classList.toggle('cloud-mode', cloud && !sessionExpired);
+  $('#workspace-status').classList.toggle('session-expired', sessionExpired);
+  $('#account-controls').hidden = !cloud;
+  $('#auth-open').hidden = cloud && !sessionExpired;
+  $('#auth-open').textContent = sessionExpired ? '重新登录' : knownSessionUser ? '打开账号' : '登录 / 注册';
+  $('#account-name').textContent = cloud ? accountUser.displayName || accountUser.username : '';
+  $('#cloud-import').hidden = !cloud;
+  $('#account-reauth').hidden = !sessionExpired;
+  $('#cloud-import').disabled = writeBusy || sessionExpired;
+  $('#cloud-refresh').disabled = writeBusy || sessionExpired;
+  $('#account-logout').disabled = writeBusy;
+  $('#auth-open').disabled = writeBusy;
+  $('#account-notice-text').textContent = sessionExpired ? '登录已过期。草稿仍在这里，请重新登录原账号后继续。' : cloudNeedsRefresh ? '云端日程已有更新，请刷新后再核对。未保存的草稿会保留。' : cloud ? '这里展示你的账号日程。可手动刷新其他设备的修改，本地日程不会自动上传。' : '本地体验的日程保存在当前浏览器。登录后可使用独立的账号日程。';
+  $('#privacy-copy').textContent = cloud ? '图片在本地识别 · 已确认日程保存在你的账号中' : '图片在本地处理 · 数据只保存在此浏览器';
+}
+
+function setWriting(busy) {
+  writeBusy = busy;
+  $$('.event-card input,.event-card select,.event-card button,[data-edit],[data-delete],[data-export]').forEach(el => el.disabled = busy);
+  $('#recognize-button').disabled = busy || recognizing || !sourceData;
+  $('#parse-text').disabled = busy || recognizing;
+  $('#auth-submit').disabled = busy;
+  $('#auth-close').disabled = busy;
+  accountUI(); updateStats();
+}
+
+function canSwitchAccount() {
+  if (writeBusy) { toast('正在保存或读取日程，请稍等。'); return false; }
+  if (recognizing) { toast('请先完成或取消当前识别。'); return false; }
+  if (drafts.length) { toast('请先保存或舍弃待核对事项，再切换账号或退出。'); return false; }
+  return true;
+}
+
+function cloudError(error, form) {
+  if (error.status === 401 && accountUser) sessionExpired = true;
+  if (error.status === 409) cloudNeedsRefresh = true;
+  const message = error.status === 401 ? '登录已过期。请重新登录原账号，草稿已保留。' : error.status === 409 ? '云端内容已变化或该事项已存在。请刷新后核对；编辑旧版本时，请舍弃草稿后重新编辑。' : error.message || '操作未完成，请重试。';
+  if (form) $('.form-errors', form).textContent = message;
+  toast(message, 'error'); accountUI();
+}
+
+async function assertCloudSession() {
+  if (!accountUser || sessionExpired) throw new APIError('请重新登录原账号后继续。', 401, 'AUTH_REQUIRED');
+  const session = await api.session();
+  if (!session.user || session.user.id !== accountUser.id) throw new APIError('账号已在其他页面退出或切换，请重新登录原账号。', 401, 'ACCOUNT_CHANGED');
+}
+
+async function activateAccount(user) {
+  api.setAccount(user.id);
+  let result;
+  try { result = await api.list(); }
+  catch (error) { api.setAccount(accountUser?.id || null); throw error; }
+  accountUser = user; knownSessionUser = user; sessionExpired = false; cloudNeedsRefresh = false;
+  events = result.events; $('#timeline-search').value = ''; $('#timeline-filter').value = 'all';
+  renderTimeline(); accountUI();
+}
+
+async function initializeAccount() {
+  try {
+    const health = await api.health();
+    if (!health.ok) throw new Error('Unavailable');
+    apiAvailable = true;
+    const session = await api.session(); knownSessionUser = session.user;
+    if (session.user && !drafts.length && !recognizing && !writeBusy) {
+      setWriting(true);
+      try { await activateAccount(session.user); } finally { setWriting(false); }
+    }
+  } catch { apiAvailable = false; }
+  accountUI(); renderAuthMode();
+}
+
+function renderAuthMode() {
+  const registration = authMode === 'register' && !sessionExpired;
+  $('#auth-title').textContent = sessionExpired ? '重新登录，继续核对' : registration ? '给重要时刻一个家' : '欢迎回到拾刻';
+  $('#auth-login-tab').classList.toggle('is-active', !registration);
+  $('#auth-register-tab').classList.toggle('is-active', registration);
+  $('#auth-login-tab').setAttribute('aria-selected', String(!registration));
+  $('#auth-register-tab').setAttribute('aria-selected', String(registration));
+  $('#auth-register-tab').disabled = sessionExpired;
+  $('#auth-display-field').hidden = !registration;
+  $('#auth-confirm-field').hidden = !registration;
+  $('#auth-password-confirm').required = registration;
+  $('#auth-password').autocomplete = registration ? 'new-password' : 'current-password';
+  $('#auth-username').readOnly = sessionExpired;
+  if (sessionExpired) $('#auth-username').value = accountUser.username;
+  $('#auth-submit').textContent = registration ? '创建账号' : '登录';
+  $('#auth-unavailable').hidden = apiAvailable !== false;
+  $('#auth-form').hidden = apiAvailable === false;
+  $('.auth-tabs').hidden = apiAvailable === false;
+}
+
+async function openAuth() {
+  if (writeBusy) return;
+  if (!sessionExpired && !canSwitchAccount()) return;
+  if (!sessionExpired && knownSessionUser && apiAvailable) {
+    setWriting(true);
+    try { await activateAccount(knownSessionUser); toast('已打开你的账号日程。', 'success'); }
+    catch (error) { knownSessionUser = null; cloudError(error); }
+    finally { setWriting(false); }
+    if (accountUser) return;
+  }
+  $('#auth-error').textContent = '';
+  renderAuthMode(); $('#auth-dialog').showModal();
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+  if (writeBusy || apiAvailable === false) return;
+  if (!sessionExpired && !canSwitchAccount()) return;
+  const username = sessionExpired ? accountUser.username : $('#auth-username').value.trim();
+  const password = $('#auth-password').value;
+  const registration = authMode === 'register' && !sessionExpired;
+  if (registration && password !== $('#auth-password-confirm').value) { $('#auth-error').textContent = '两次输入的密码不一致，请再检查一下。'; return; }
+  $('#auth-error').textContent = ''; setWriting(true);
+  try {
+    const result = registration ? await api.register({username,password,displayName:$('#auth-display-name').value.trim() || username}) : await api.login({username,password});
+    if (accountUser && result.user.id !== accountUser.id) throw new APIError('请登录原账号后继续处理草稿。', 401, 'ACCOUNT_CHANGED');
+    if (sessionExpired) {
+      accountUser = result.user; knownSessionUser = result.user; sessionExpired = false; api.setAccount(result.user.id);
+      toast('已重新登录，未保存草稿已保留。', 'success');
+    } else {
+      knownSessionUser = result.user; await activateAccount(result.user);
+      toast(registration ? '账号已创建。本地日程仍保留，可按需导入。' : '已登录，本地日程与账号日程各自保留。', 'success');
+    }
+    $('#auth-dialog').close(); $('#auth-password').value = ''; $('#auth-password-confirm').value = ''; accountUI();
+  } catch (error) { $('#auth-error').textContent = error.message || '登录未完成，请重试。'; }
+  finally { setWriting(false); }
+}
+
+async function logoutAccount() {
+  if (!canSwitchAccount()) return;
+  setWriting(true);
+  try {
+    try { await api.logout(); } catch (error) { if (error.status !== 401) throw error; }
+    accountUser = null; knownSessionUser = null; sessionExpired = false; cloudNeedsRefresh = false; api.setAccount(null);
+    restore(); renderTimeline(); accountUI(); toast('已退出，回到本地日程。', 'success');
+  } catch (error) { cloudError(error); }
+  finally { setWriting(false); }
+}
+
+async function refreshCloud() {
+  if (!accountUser || writeBusy) return;
+  setWriting(true);
+  try { await assertCloudSession(); const result = await api.list(); events = result.events; cloudNeedsRefresh = false; renderTimeline(); accountUI(); toast(drafts.some(e => e.editingId) ? '已刷新。正在编辑的旧版本请对照新版，舍弃后重新编辑。' : '云端日程已刷新，草稿保持不变。', 'success'); }
+  catch (error) { cloudError(error); }
+  finally { setWriting(false); }
+}
+
+function importBatches(local) {
+  const fields = ['title','kind','date','startTime','endDate','endTime','location','sourceText','sourceName','origin','notes','dateConfirmed','reminderMinutes'];
+  const encoder = new TextEncoder();
+  const bytes = list => encoder.encode(JSON.stringify({events:list})).length;
+  const batches = []; let batch = [];
+  for (const original of local) {
+    const candidate = Object.fromEntries(fields.filter(key => original[key] !== undefined).map(key => [key,original[key]]));
+    if (bytes([candidate]) > 120 * 1024) throw new Error(`“${String(original.title).slice(0,35)}”的内容太长，无法导入。请缩短该日程的原文或备注后再试；尚未上传任何日程。`);
+    if (batch.length && (batch.length >= 50 || bytes([...batch,candidate]) > 90 * 1024)) { batches.push(batch); batch = []; }
+    batch.push(candidate);
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+async function importLocalEvents() {
+  if (!accountUser || writeBusy || sessionExpired) return;
+  if (drafts.length) return toast('请先保存或舍弃待核对事项，再导入本地日程。');
+  let local, batches;
+  try { local = localSnapshot(); batches = importBatches(local); } catch (error) { return toast(error.message, 'error'); }
+  if (!local.length) return toast('当前浏览器没有可导入的本地日程。');
+  let imported = 0, skipped = 0, processed = 0;
+  setWriting(true);
+  try {
+    for (const batch of batches) {
+      $('#cloud-import').textContent = `正在导入 ${processed} / ${local.length}`;
+      await assertCloudSession();
+      const result = await api.import(batch);
+      imported += result.imported; skipped += result.skipped; processed += batch.length;
+      events = result.events; cloudNeedsRefresh = false; renderTimeline();
+    }
+    toast(`已导入 ${imported} 个日程，跳过 ${skipped} 个重复事项。本地记录仍保留。`, 'success');
+  } catch (error) {
+    cloudError(error);
+    toast(`导入尚未全部完成：已确认导入 ${imported} 个、跳过 ${skipped} 个。其余结果尚未确认，请刷新后重试；重复事项会自动跳过，原本地记录均保留。`, 'error');
+  } finally { $('#cloud-import').textContent = '导入本地日程'; setWriting(false); }
+}
+
 function setStatus(message, type = '') { const el = $('#analysis-status'); el.textContent = message; el.className = `analysis-status ${type}`; }
 function setBusy(busy) {
   recognizing = busy;
-  $('#recognize-button').disabled = busy || !sourceData;
-  $('#parse-text').disabled = busy;
-  $('#source-text').disabled = busy;
-  $('#reference-date').disabled = busy;
-  $('#ocr-layout').disabled = busy;
+  $('#recognize-button').disabled = busy || writeBusy || !sourceData;
+  $('#parse-text').disabled = busy || writeBusy;
+  $('#source-text').disabled = busy || writeBusy;
+  $('#reference-date').disabled = busy || writeBusy;
+  $('#ocr-layout').disabled = busy || writeBusy;
   $('#ocr-progress').hidden = !busy;
-  $('#upload-trigger').disabled = busy;
-  $$('[data-example]').forEach(button => button.disabled = busy);
+  $('#upload-trigger').disabled = busy || writeBusy;
+  $$('[data-example]').forEach(button => button.disabled = busy || writeBusy);
 }
 
 async function rasterize(src) {
@@ -76,6 +285,7 @@ async function rasterize(src) {
 }
 
 async function loadImage(src, name) {
+  if (writeBusy) return toast('请先等待当前操作完成。');
   if (recognizing) return toast('请先等待识别完成，或取消本次识别。');
   if (drafts.length) return toast('请先保存或舍弃待核对事项，再选择另一张截图。');
   try {
@@ -132,7 +342,7 @@ async function getWorker(token) {
 }
 
 async function recognize() {
-  if (!sourceData || recognizing) return;
+  if (!sourceData || recognizing || writeBusy) return;
   if (drafts.length) return toast('请先保存或舍弃待核对事项，再重新识别。');
   const token = ++operation;
   setBusy(true); setStatus('正在读取截图，原图和识别内容仅在当前浏览器处理。');
@@ -170,6 +380,7 @@ async function cancelOCR() {
 }
 
 function parseSource(origin = '粘贴文字') {
+  if (writeBusy) return toast('请先等待当前操作完成。');
   if (drafts.length) return toast('请先保存或舍弃待核对事项，再重新整理。');
   const text = $('#source-text').value.trim();
   if (!text) return toast('请先粘贴通知文字，或识别一张截图。', 'error');
@@ -233,8 +444,9 @@ function readDraft(form) {
   return {...old, title:String(data.get('title') || '').trim(), date:String(data.get('date') || ''), startTime:String(data.get('startTime') || ''), endDate:String(data.get('endDate') || ''), endTime:String(data.get('endTime') || ''), location:String(data.get('location') || '').trim(), dateConfirmed:data.get('confirmed') === 'on', reminderMinutes:data.get('reminderMinutes') === 'none' ? null : Number(data.get('reminderMinutes')), updatedAt:new Date().toISOString()};
 }
 
-function saveDraft(event) {
+async function saveDraft(event) {
   event.preventDefault();
+  if (writeBusy) return;
   const form = event.currentTarget;
   const index = Number(form.dataset.draftIndex);
   const draft = readDraft(form);
@@ -252,10 +464,18 @@ function saveDraft(event) {
   const saved = {...draft, id:draft.editingId || crypto.randomUUID(), sequence:(events.find(e => e.id === draft.editingId)?.sequence ?? -1) + 1};
   delete saved.editingId; delete saved.pendingConflict; delete saved.conflictTitles; delete saved.conflictSignature;
   const next = [...events.filter(e => e.id !== saved.id), saved];
-  if (!persist(next)) return;
-  drafts.splice(index, 1); renderDrafts();
-  setStatus(drafts.length ? '已保存一项，请继续核对剩余事项。' : '全部核对完成，可以在时间线中导出日历。', 'success');
-  toast(draft.editingId ? '修改已保存。重新导出后请在日历中核对旧事件。' : '已保存到你的时间线。', 'success');
+  setWriting(true);
+  try {
+    if (accountUser) {
+      await assertCloudSession();
+      const result = draft.editingId ? await api.update(draft.editingId, saved, draft.version) : await api.create(saved);
+      events = [...events.filter(e => e.id !== result.event.id), result.event]; renderTimeline();
+    } else if (!persist(next)) return;
+    drafts.splice(index, 1); renderDrafts();
+    setStatus(drafts.length ? '已保存一项，请继续核对剩余事项。' : '全部核对完成，可以在时间线中导出日历。', 'success');
+    toast(draft.editingId ? '修改已保存。重新导出后请在日历中核对旧事件。' : accountUser ? '已保存到你的云端日程。' : '已保存到本地时间线。', 'success');
+  } catch (error) { cloudError(error, form); }
+  finally { setWriting(false); }
 }
 
 function dateLabel(date) {
@@ -267,7 +487,7 @@ function updateStats() {
   $('#stats-saved').textContent = events.length;
   $('#stats-drafts').textContent = drafts.length;
   $('#stats-upcoming').textContent = events.filter(e => Date.parse(`${e.date}T${e.startTime}:00+08:00`) >= Date.now()).length;
-  $('#export-all').disabled = !events.length;
+  $('#export-all').disabled = !events.length || writeBusy || sessionExpired;
   const count = $('#sidebar-count'); if (count) count.textContent = events.length;
 }
 
@@ -293,33 +513,65 @@ function renderTimeline() {
 }
 
 function editEvent(id) {
+  if (writeBusy) return;
   if (recognizing) return toast('请先完成当前识别。');
   if (drafts.some(e => e.editingId === id)) return toast('该事项已在待核对区域。');
   const item = events.find(e => e.id === id);
+  if (!item) return;
   drafts.push({...item, editingId:id, dateConfirmed:false}); renderDrafts();
   $('#capture-section').scrollIntoView({behavior:'smooth',block:'start'});
   setStatus('修改后请重新核对，确认保存才会更新已有事项。');
 }
 
-function removeEvent(id) {
+async function removeEvent(id) {
+  if (writeBusy) return;
   const removed = events.find(e => e.id === id);
   if (!removed) return;
-  if (persist(events.filter(e => e.id !== id))) toast('事项已移除。', 'info', () => { if (!events.some(e => e.id === id)) persist([...events, removed]); });
+  if (drafts.some(e => e.editingId === id)) return toast('该事项正在编辑，请先保存或舍弃对应草稿。');
+  const owner = accountUser?.id || null;
+  setWriting(true);
+  try {
+    if (accountUser) {
+      await assertCloudSession();
+      await api.remove(id, removed.version); events = events.filter(e => e.id !== id); renderTimeline();
+    } else if (!persist(events.filter(e => e.id !== id))) return;
+    toast('事项已移除。', 'info', async () => {
+      if ((accountUser?.id || null) !== owner) { toast('当前空间已切换，无法在这里撤销。'); return false; }
+      if (events.some(e => e.id === id)) return true;
+      setWriting(true);
+      try {
+        if (accountUser) {
+          await assertCloudSession();
+          const restored = {...removed}; delete restored.version;
+          const result = await api.create(restored); events = [...events, result.event]; renderTimeline();
+        } else if (!persist([...events, removed])) return false;
+        toast('事项已恢复。', 'success'); return true;
+      } catch (error) { cloudError(error); return false; }
+      finally { setWriting(false); }
+    });
+  } catch (error) { cloudError(error); }
+  finally { setWriting(false); }
 }
 
-function exportCalendar(items) {
+async function exportCalendar(items) {
+  if (writeBusy) return;
   if (!items.length) return toast('先核对并保存一个事项，再导出日历。');
+  setWriting(true);
   try {
-    const ics = buildICS(items);
-    const blob = new Blob([ics], {type:'text/calendar;charset=utf-8'});
+    if (accountUser) await assertCloudSession();
+    const allIds = new Set(events.map(e => e.id));
+    const allSelected = items.length === events.length && items.every(e => allIds.has(e.id));
+    const blob = accountUser ? await api.calendar(allSelected ? undefined : items.map(e => e.id)) : new Blob([buildICS(items)], {type:'text/calendar;charset=utf-8'});
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a'); link.href = url; link.download = `拾刻日程-${todayShanghai()}.ics`; document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
     toast(`已导出 ${items.length} 个事项。请在日历应用中导入，提醒由日历应用发送。`, 'success');
-  } catch (error) { toast(error.message || '导出失败，请重新核对事项。', 'error'); }
+  } catch (error) { cloudError(error); }
+  finally { setWriting(false); }
 }
 
 function resetCapture() {
+  if (writeBusy) return toast('请先等待当前操作完成。');
   if (recognizing) return toast('请先取消或完成当前识别。');
   if (drafts.length) { toast('请先保存或舍弃待核对事项，避免丢失修改。'); return; }
   sourceData = ''; sourceName = '';
@@ -364,5 +616,24 @@ for (const [id, target] of [['nav-inbox','capture-section'],['nav-timeline','tim
 $('#nav-help').onclick = () => $('#help-dialog').showModal();
 $('#help-close').onclick = () => $('#help-dialog').close();
 $('#help-dialog').addEventListener('click', event => { if (event.target === $('#help-dialog')) $('#help-dialog').close(); });
-window.addEventListener('storage', event => { if (event.key === KEY) { restore(); renderTimeline(); toast('已同步同一浏览器其他标签页的修改。'); } });
-restore(); renderDrafts(); renderTimeline();
+$('#auth-open').onclick = openAuth;
+$('#account-reauth').onclick = openAuth;
+$('#auth-close').onclick = () => { if (!writeBusy) $('#auth-dialog').close(); };
+$('#auth-dialog').addEventListener('cancel', event => { if (writeBusy) event.preventDefault(); });
+$('#auth-dialog').addEventListener('click', event => { if (!writeBusy && event.target === $('#auth-dialog')) $('#auth-dialog').close(); });
+$('#auth-form').addEventListener('submit', submitAuth);
+$('#auth-login-tab').onclick = () => { if (!writeBusy) { authMode = 'login'; $('#auth-error').textContent = ''; renderAuthMode(); } };
+$('#auth-register-tab').onclick = () => { if (!writeBusy && !sessionExpired) { authMode = 'register'; $('#auth-error').textContent = ''; renderAuthMode(); } };
+$('#auth-retry').onclick = async () => {
+  if (writeBusy) return; setWriting(true);
+  try { const result = await api.health(); apiAvailable = result.ok === true; }
+  catch { apiAvailable = false; }
+  finally { setWriting(false); renderAuthMode(); }
+};
+$('#account-logout').onclick = logoutAccount;
+$('#cloud-refresh').onclick = refreshCloud;
+$('#cloud-import').onclick = importLocalEvents;
+window.addEventListener('storage', event => { if (!accountUser && (event.key === KEY || event.key === null)) { restore(); renderTimeline(); toast('已同步同一浏览器其他标签页的本地日程。'); } });
+window.addEventListener('beforeunload', event => { if (drafts.length || writeBusy) { event.preventDefault(); event.returnValue = ''; } });
+restore(); renderDrafts(); renderTimeline(); accountUI();
+void initializeAccount();

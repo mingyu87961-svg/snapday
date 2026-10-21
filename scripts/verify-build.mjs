@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 // This static build is independent of a hosting provider or project account.
 const root = new URL('../', import.meta.url);
 const paths = [
-  'dist/index.html', 'dist/styles.css', 'dist/app.mjs', 'dist/lib/engine.mjs',
+  'dist/index.html', 'dist/styles.css', 'dist/app.mjs', 'dist/lib/engine.mjs', 'dist/lib/api-client.mjs',
   'dist/assets/favicon.svg', 'dist/assets/photo.svg', 'dist/assets/camp.svg', 'dist/assets/lecture.svg',
   'dist/vendor/tesseract.min.js', 'dist/vendor/worker.min.js',
   'dist/vendor/tesseract-core.wasm.js', 'dist/vendor/tesseract-core.wasm',

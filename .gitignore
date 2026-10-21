@@ -10,5 +10,9 @@ node_modules/
 artifacts/
 local-notes/
 .private/
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 .DS_Store
 Thumbs.db

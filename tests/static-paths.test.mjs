@@ -35,12 +35,13 @@ function bootApp(moduleURL) {
     if (!elements.has(selector)) elements.set(selector, {
       value: selector === '#timeline-filter' ? 'all' : '',
       classList: { add() {}, remove() {}, toggle() {} },
-      addEventListener() {}, append() {},
+      addEventListener() {}, append() {}, setAttribute() {},
     });
     return elements.get(selector);
   };
   const context = vm.createContext({
     URL, Intl, Date, console,
+    api: { health:async () => ({ok:false}) }, APIError:Error,
     // A different document URL proves resource paths use their module's base.
     location: { href: 'https://unrelated.invalid/other/page.html' },
     localStorage: { getItem: () => null },
@@ -60,7 +61,7 @@ function bootApp(moduleURL) {
       } },
     },
   });
-  const executable = app.replace(/^import .* from .*;\r?\n/, '')
+  const executable = app.replace(/^import .* from .*;\r?\n/gm, '')
     .replaceAll('import.meta.url', JSON.stringify(moduleURL));
   vm.runInContext(executable, context, { filename: 'app.mjs' });
   context.rasterize = async src => { loadedImages.push(src); return 'data:image/png;base64,AA=='; };
